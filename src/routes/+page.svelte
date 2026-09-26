@@ -2,10 +2,10 @@
   import { onMount } from 'svelte'
   import Button from 'flowbite-svelte/Button.svelte'
   import {
-    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, ANNOUNCEMENT_TTL, canRedo, canUndo,
+    clearDuplicate, deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder,
+    setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, syncAnnouncementTimers,
+    termTarget, undoDesk, updateCue, updateSession, updateSpeaker, updateTerm
   } from '$lib/store'
   import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
 
@@ -16,6 +16,11 @@
     'This evidence helps us prioritize investments where vulnerability is highest.',
     'We will publish the indicator framework before the next budget cycle.'
   ]
+  const levelMeta: Record<Announcement['level'], { label: string; stage: string; hint: string }> = {
+    urgent: { label: '紧急通知', stage: 'border-orange-300/30 bg-orange-500/15', hint: 'text-orange-200' },
+    warning: { label: '时间提醒', stage: 'border-amber-300/30 bg-amber-400/15', hint: 'text-amber-200' },
+    info: { label: '信息提示', stage: 'border-sky-300/30 bg-sky-400/15', hint: 'text-sky-200' }
+  }
   let tab: TabId = 'live'
   let now = Date.now()
   let manualText = ''
@@ -39,9 +44,14 @@
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
   $: unreadReminders = $desk.reminders.filter(item => !item.acknowledged)
+  $: stageAnnouncement = $desk.announcements.find(item => item.visibleOnStage)
+  $: stageRemaining = stageAnnouncement
+    ? Math.max(0, Math.ceil((new Date(stageAnnouncement.publishedAt || stageAnnouncement.createdAt).getTime() + ANNOUNCEMENT_TTL[stageAnnouncement.level] * 1000 - now) / 1000))
+    : 0
 
   onMount(() => {
     if (typeof navigator !== 'undefined') setOnline(navigator.onLine)
+    syncAnnouncementTimers()
     const onlineHandler = () => setOnline(true)
     const offlineHandler = () => setOnline(false)
     window.addEventListener('online', onlineHandler)
@@ -104,6 +114,15 @@
     addAnnouncement(announcementText, announcementLevel)
     announcementText = ''
     flash('紧急通知已保存到后台。')
+  }
+  function toggleAnnouncement(announcement: Announcement) {
+    if (announcement.visibleOnStage) {
+      publishAnnouncement(announcement.id, false)
+      flash('通知已撤下现场。')
+    } else {
+      publishAnnouncement(announcement.id, true)
+      flash(`已发布到现场，${ANNOUNCEMENT_TTL[announcement.level]} 秒后自动收回。`)
+    }
   }
   function formatTime(timestamp: number) {
     return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
@@ -193,9 +212,16 @@
               <span class="rounded-full bg-teal-600 px-2.5 py-1 text-[10px] font-black text-white">STAGE OUTPUT</span>
             </div>
             <div class="space-y-3 p-4">
-              {#each $desk.announcements.filter(item => item.visibleOnStage) as item}
-                <div class="rounded-xl border border-orange-300/30 bg-orange-500/15 p-3"><strong class="text-xs text-orange-200">紧急通知</strong><p class="mt-1 text-lg font-bold">{item.text}</p></div>
-              {/each}
+              {#if stageAnnouncement}
+                {@const meta = levelMeta[stageAnnouncement.level]}
+                <div class="rounded-xl border p-3 {meta.stage}">
+                  <div class="flex items-center justify-between gap-3">
+                    <strong class="text-xs {meta.hint}">{meta.label}</strong>
+                    <span class="rounded-full bg-black/20 px-2 py-0.5 text-[10px] font-bold {meta.hint}">{stageRemaining}s 后自动收回</span>
+                  </div>
+                  <p class="mt-1 text-lg font-bold">{stageAnnouncement.text}</p>
+                </div>
+              {/if}
               {#each $desk.cues.filter(item => item.status === 'confirmed').slice(-2) as cue}
                 <div class="rounded-xl bg-white/10 p-3">
                   <div class="mb-1 flex justify-between text-[10px] text-teal-200"><span>{speakerName($desk, cue.speakerId)}</span><span>{formatTime(cue.receivedAt)}</span></div>
@@ -331,18 +357,35 @@
           </div>
         </section>
         <section class="rounded-2xl border bg-white p-4 shadow-sm">
-          <div class="mb-4"><h2 class="font-black">紧急通知</h2><p class="text-xs text-slate-500">先保存到后台，再由管理员明确发布到现场。</p></div>
+          <div class="mb-4"><h2 class="font-black">紧急通知</h2><p class="text-xs text-slate-500">发布后按级别自动收回：紧急 20 秒、时间提醒 12 秒、信息提示 8 秒；现场同时只保留一条，发新通知会立即换下旧通知。</p></div>
           <select class="focus-ring w-full rounded-xl border p-3 text-sm" bind:value={announcementLevel}><option value="info">信息提示</option><option value="warning">时间提醒</option><option value="urgent">紧急通知</option></select>
           <textarea class="focus-ring mt-3 w-full rounded-xl border p-3 text-sm" rows="3" bind:value={announcementText} placeholder="输入通知内容…"></textarea>
           <Button class="mt-3 w-full" disabled={!announcementText.trim()} on:click={createAnnouncement}>保存到后台</Button>
           <div class="mt-6 space-y-3">
             {#each $desk.announcements as announcement}
               <div class="rounded-xl border p-3 {announcement.visibleOnStage ? 'border-orange-300 bg-orange-50' : 'border-slate-200 bg-slate-50'}">
-                <div class="flex items-center justify-between gap-3"><span class="rounded-full bg-white px-2 py-1 text-[10px] font-bold">{announcement.level === 'urgent' ? '紧急' : announcement.level === 'warning' ? '提醒' : '信息'}</span><span class="text-[10px] font-bold {announcement.visibleOnStage ? 'text-orange-700' : 'text-slate-500'}">{announcement.visibleOnStage ? '现场可见' : '仅后台'}</span></div>
+                <div class="flex items-center justify-between gap-3"><span class="rounded-full bg-white px-2 py-1 text-[10px] font-bold">{levelMeta[announcement.level].label} · {ANNOUNCEMENT_TTL[announcement.level]}s</span><span class="text-[10px] font-bold {announcement.visibleOnStage ? 'text-orange-700' : 'text-slate-500'}">{announcement.visibleOnStage ? `现场可见 · ${stageRemaining}s 后收回` : '仅后台'}</span></div>
                 <p class="my-2 text-sm font-bold">{announcement.text}</p>
-                <Button size="xs" color={announcement.visibleOnStage ? 'light' : 'yellow'} on:click={() => publishAnnouncement(announcement.id, !announcement.visibleOnStage)}>{announcement.visibleOnStage ? '撤下现场' : '发布到现场'}</Button>
+                <Button size="xs" color={announcement.visibleOnStage ? 'light' : 'yellow'} on:click={() => toggleAnnouncement(announcement)}>{announcement.visibleOnStage ? '撤下现场' : '发布到现场'}</Button>
               </div>
             {/each}
+          </div>
+          <div class="mt-6 border-t pt-4">
+            <div class="mb-2 flex items-center justify-between"><h3 class="text-sm font-black">上下架记录</h3><span class="text-[10px] text-slate-500">{$desk.announcementLog.length} 条</span></div>
+            <div class="max-h-64 space-y-2 overflow-y-auto scrollbar-thin">
+              {#each $desk.announcementLog as entry}
+                <div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="rounded-full px-2 py-0.5 text-[10px] font-black {entry.action === 'up' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'}">{entry.action === 'up' ? '上架' : '下架'}</span>
+                    <time class="text-[10px] text-slate-500">{formatTime(new Date(entry.at).getTime())}</time>
+                  </div>
+                  <p class="mt-1 font-bold">{entry.text}</p>
+                  <p class="mt-0.5 text-[10px] text-slate-500">{levelMeta[entry.level].label} · {entry.reason}</p>
+                </div>
+              {:else}
+                <p class="py-3 text-center text-xs text-slate-400">暂无上下架记录。</p>
+              {/each}
+            </div>
           </div>
         </section>
       </div>

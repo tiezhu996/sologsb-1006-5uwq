@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, AnnouncementLogEntry, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -34,9 +34,10 @@ function demoState(): DeskState {
   return {
     speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
     announcements: [
-      { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
-      { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
+      { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString(), publishedAt: null },
+      { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString(), publishedAt: null }
     ],
+    announcementLog: [],
     online: true, liveSimulation: true, updatedAt: new Date().toISOString()
   }
 }
@@ -71,12 +72,14 @@ export function undoDesk() {
   if (!previous) return
   future.push(clone(get(desk)))
   desk.set(previous); persist(previous)
+  syncAnnouncementTimers()
 }
 export function redoDesk() {
   const next = future.pop()
   if (!next) return
   history.push(clone(get(desk)))
   desk.set(next); persist(next)
+  syncAnnouncementTimers()
 }
 export const canUndo = () => history.length > 0
 export const canRedo = () => future.length > 0
@@ -93,9 +96,91 @@ export function addTerm() { commit(state => state.terms.push({ id: `term-${Date.
 export function updateTerm(id: string, patch: Partial<Term>) { commit(state => { const item = state.terms.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
 export function addAnnouncement(text: string, level: Announcement['level']) {
   if (!text.trim()) return
-  commit(state => state.announcements.unshift({ id: `ann-${Date.now()}`, level, text: text.trim(), visibleOnStage: false, createdAt: new Date().toISOString() }))
+  commit(state => state.announcements.unshift({ id: `ann-${Date.now()}`, level, text: text.trim(), visibleOnStage: false, createdAt: new Date().toISOString(), publishedAt: null }))
 }
-export function publishAnnouncement(id: string, visible: boolean) { commit(state => { const item = state.announcements.find(row => row.id === id); if (item) item.visibleOnStage = visible }) }
+
+// 通知按级别自动收回：紧急 20 秒、时间提醒 12 秒、信息提示 8 秒
+export const ANNOUNCEMENT_TTL: Record<Announcement['level'], number> = { urgent: 20, warning: 12, info: 8 }
+const announcementTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function logAnnouncement(state: DeskState, item: Announcement, action: AnnouncementLogEntry['action'], reason: string) {
+  state.announcementLog.unshift({
+    id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    announcementId: item.id, level: item.level, text: item.text, action, reason, at: new Date().toISOString()
+  })
+  if (state.announcementLog.length > 200) state.announcementLog.length = 200
+}
+function clearAnnouncementTimer(id: string) {
+  const timer = announcementTimers.get(id)
+  if (timer) { clearTimeout(timer); announcementTimers.delete(id) }
+}
+function retractAnnouncement(id: string, reason: string) {
+  commit(state => {
+    const item = state.announcements.find(row => row.id === id)
+    if (!item || !item.visibleOnStage) return
+    item.visibleOnStage = false
+    item.publishedAt = null
+    logAnnouncement(state, item, 'down', reason)
+  })
+}
+function armAnnouncementTimer(id: string, delayMs?: number) {
+  clearAnnouncementTimer(id)
+  const item = get(desk).announcements.find(row => row.id === id)
+  if (!item) return
+  const wait = delayMs ?? ANNOUNCEMENT_TTL[item.level] * 1000
+  announcementTimers.set(id, setTimeout(() => {
+    announcementTimers.delete(id)
+    // 到点时若现场已换成别的通知，旧计时不能把新通知一起带走
+    const current = get(desk).announcements.find(row => row.id === id)
+    if (!current?.visibleOnStage) return
+    retractAnnouncement(id, `展示满 ${ANNOUNCEMENT_TTL[current.level]} 秒，到点自动收回`)
+  }, wait))
+}
+function announcementPublishTime(item: Announcement): number {
+  return new Date(item.publishedAt || item.createdAt).getTime()
+}
+// 页面加载、撤销重做后校准：在场的通知按剩余时间重新计时，多余的立即收回
+export function syncAnnouncementTimers() {
+  const visible = get(desk).announcements
+    .filter(row => row.visibleOnStage)
+    .sort((a, b) => announcementPublishTime(b) - announcementPublishTime(a))
+  visible.forEach((row, index) => {
+    if (index > 0) {
+      clearAnnouncementTimer(row.id)
+      retractAnnouncement(row.id, '现场同时只保留一条通知，收回较早的一条')
+      return
+    }
+    const remaining = announcementPublishTime(row) + ANNOUNCEMENT_TTL[row.level] * 1000 - Date.now()
+    armAnnouncementTimer(row.id, Math.max(remaining, 0))
+  })
+}
+export function publishAnnouncement(id: string, visible: boolean) {
+  commit(state => {
+    const item = state.announcements.find(row => row.id === id)
+    if (!item) return
+    if (visible) {
+      // 现场同时只留一条：新通知上架时旧通知立即换下，并停掉它的计时
+      state.announcements.forEach(row => {
+        if (row.id !== id && row.visibleOnStage) {
+          row.visibleOnStage = false
+          row.publishedAt = null
+          clearAnnouncementTimer(row.id)
+          logAnnouncement(state, row, 'down', '新通知上架，本条被替换收回')
+        }
+      })
+      item.visibleOnStage = true
+      item.publishedAt = new Date().toISOString()
+      logAnnouncement(state, item, 'up', `管理员发布到现场，按级别展示 ${ANNOUNCEMENT_TTL[item.level]} 秒`)
+    } else {
+      if (!item.visibleOnStage) return
+      item.visibleOnStage = false
+      item.publishedAt = null
+      clearAnnouncementTimer(id)
+      logAnnouncement(state, item, 'down', '管理员手动撤下')
+    }
+  })
+  if (visible) armAnnouncementTimer(id)
+}
 
 export function setOnline(online: boolean) {
   commit(state => {
