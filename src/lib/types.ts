@@ -34,6 +34,17 @@ export interface Announcement {
   text: string
   visibleOnStage: boolean
   createdAt: string
+  publishedAt: number | null
+}
+
+export interface AnnouncementLogEntry {
+  id: string
+  announcementId: string
+  level: Announcement['level']
+  text: string
+  action: 'publish' | 'retract'
+  reason: string
+  at: string
 }
 
 export interface Cue {
@@ -64,6 +75,7 @@ export interface DeskState {
   sessions: Session[]
   terms: Term[]
   announcements: Announcement[]
+  announcementLog: AnnouncementLogEntry[]
   cues: Cue[]
   reminders: Reminder[]
   activeCueId: string

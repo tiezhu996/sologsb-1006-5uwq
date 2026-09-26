@@ -1,7 +1,9 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, AnnouncementLogEntry, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
+// 现场通知按级别到点自动收回的展示时长（秒）
+export const STAGE_DURATIONS: Record<Announcement['level'], number> = { urgent: 20, warning: 12, info: 8 }
 const speakers: Speaker[] = [
   { id: 'sp-1', name: 'Dr. Maya Chen', title: '首席气候科学家', language: '英语 → 中文', color: '#0f766e' },
   { id: 'sp-2', name: '刘启明', title: '城市韧性研究员', language: '中文 → 英语', color: '#b45309' },
@@ -34,9 +36,10 @@ function demoState(): DeskState {
   return {
     speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
     announcements: [
-      { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
-      { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
+      { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString(), publishedAt: null },
+      { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString(), publishedAt: null }
     ],
+    announcementLog: [],
     online: true, liveSimulation: true, updatedAt: new Date().toISOString()
   }
 }
@@ -45,8 +48,17 @@ function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    return saved ? normalize({ ...demoState(), ...JSON.parse(saved), online: navigator.onLine }) : demoState()
   } catch { return demoState() }
+}
+function normalize(state: DeskState): DeskState {
+  state.announcements = state.announcements.map(item => ({ ...item, publishedAt: item.publishedAt ?? null }))
+  state.announcementLog = state.announcementLog || []
+  // 旧版本可能同时挂着多条现场通知：只保留最新的一条，其余悄悄撤下
+  const visible = state.announcements.filter(item => item.visibleOnStage)
+  visible.slice(1).forEach(item => { item.visibleOnStage = false; item.publishedAt = null })
+  if (visible[0] && visible[0].publishedAt == null) visible[0].publishedAt = Date.now()
+  return state
 }
 const history: DeskState[] = []
 const future: DeskState[] = []
@@ -93,9 +105,45 @@ export function addTerm() { commit(state => state.terms.push({ id: `term-${Date.
 export function updateTerm(id: string, patch: Partial<Term>) { commit(state => { const item = state.terms.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
 export function addAnnouncement(text: string, level: Announcement['level']) {
   if (!text.trim()) return
-  commit(state => state.announcements.unshift({ id: `ann-${Date.now()}`, level, text: text.trim(), visibleOnStage: false, createdAt: new Date().toISOString() }))
+  commit(state => state.announcements.unshift({ id: `ann-${Date.now()}`, level, text: text.trim(), visibleOnStage: false, createdAt: new Date().toISOString(), publishedAt: null }))
 }
-export function publishAnnouncement(id: string, visible: boolean) { commit(state => { const item = state.announcements.find(row => row.id === id); if (item) item.visibleOnStage = visible }) }
+function logAnnouncement(state: DeskState, item: Announcement, action: AnnouncementLogEntry['action'], reason: string, at: number) {
+  state.announcementLog.unshift({ id: `log-${at}-${Math.random().toString(36).slice(2, 6)}`, announcementId: item.id, level: item.level, text: item.text, action, reason, at: new Date(at).toISOString() })
+  if (state.announcementLog.length > 100) state.announcementLog.length = 100
+}
+export function publishAnnouncement(id: string) {
+  commit(state => {
+    const item = state.announcements.find(row => row.id === id)
+    if (!item || item.visibleOnStage) return
+    const now = Date.now()
+    // 同一时间现场区只留一条通知：新通知上架时，当前通知立刻换下
+    const current = state.announcements.find(row => row.visibleOnStage)
+    if (current) {
+      current.visibleOnStage = false
+      current.publishedAt = null
+      logAnnouncement(state, current, 'retract', '被新通知换下', now)
+    }
+    item.visibleOnStage = true
+    item.publishedAt = now
+    logAnnouncement(state, item, 'publish', '管理员发布到现场', now)
+  })
+}
+export function retractAnnouncement(id: string, reason = '管理员手动撤下') {
+  commit(state => {
+    const item = state.announcements.find(row => row.id === id)
+    if (!item || !item.visibleOnStage) return
+    item.visibleOnStage = false
+    item.publishedAt = null
+    logAnnouncement(state, item, 'retract', reason, Date.now())
+  })
+}
+export function retractExpiredAnnouncement(now = Date.now()) {
+  const item = get(desk).announcements.find(row => row.visibleOnStage)
+  if (!item || item.publishedAt == null) return
+  // 到期判断只依据当前这条通知自己的上架时间，上一条通知的计时不会影响它
+  const seconds = STAGE_DURATIONS[item.level]
+  if (now - item.publishedAt >= seconds * 1000) retractAnnouncement(item.id, `展示 ${seconds} 秒到期，自动收回`)
+}
 
 export function setOnline(online: boolean) {
   commit(state => {
